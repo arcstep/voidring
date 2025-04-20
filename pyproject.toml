@@ -1,6 +1,6 @@
 [project]
 name = "voidring"
-version = "0.1.1"
+version = "0.1.2"
 description = "Inspired by the infinite void of mystical storage rings, VoidRing brings immortal-grade durability to modern applications. This Python binding unleashes RocksDB's battle-tested storage core through a cultivator-friendly interface."
 authors = [
     {name = "arcstep",email = "43801@qq.com"}
