@@ -548,3 +548,107 @@ class TestBatchOperations:
             # 清理资源
             sec_db.close()
             main_db.close()
+
+class TestPaginateMethod:
+    @pytest.fixture(autouse=True)
+    def setup_logging(self, caplog):
+        caplog.set_level(logging.INFO)
+
+    @pytest.fixture
+    def db_path(self):
+        path = tempfile.mkdtemp()
+        yield path
+        shutil.rmtree(path)
+
+    def test_paginate_method(self, db_path):
+        """测试新增的paginate方法
+        
+        验证paginate方法的基本功能：
+        1. 获取第一页时不提供游标
+        2. 使用返回的next_cursor获取后续页面
+        3. 验证数据完整性和分页正确性
+        """
+        # 准备测试环境和数据
+        db = BaseRocksDB(db_path)
+        
+        # 插入100条有序测试数据
+        total_items = 100
+        page_size = 10
+        
+        # 使用有序键，确保排序可预测
+        for i in range(total_items):
+            key = f"item:{i:03d}"
+            value = f"value-{i:03d}"
+            db.put(key, value)
+        
+        # 模拟分页查询
+        all_pages_items = []
+        current_page = 1
+        next_cursor = None
+        
+        logger.info(f"开始使用paginate方法进行分页测试，页大小: {page_size}")
+        
+        while True:
+            # 使用paginate方法获取当前页
+            result = db.paginate(
+                prefix='item:', 
+                page_size=page_size,
+                cursor=next_cursor
+            )
+            
+            page_items = result['items']
+            next_cursor = result['next_cursor']
+            has_more = result['has_more']
+            
+            # 如果没有更多数据，退出循环
+            if not page_items or not has_more:
+                if not has_more:
+                    logger.info(f"分页查询完成，总共 {current_page} 页")
+                    # 添加最后一页的数据
+                    all_pages_items.extend(page_items)
+                    break
+            
+            logger.info(f"第 {current_page} 页: {[k for k, _ in page_items]}")
+            
+            # 保存结果用于验证
+            all_pages_items.extend(page_items)
+            
+            # 下一页
+            current_page += 1
+            
+            # 如果没有下一个游标，退出循环
+            if not next_cursor:
+                break
+        
+        # 验证所有数据都被正确分页
+        assert len(all_pages_items) == total_items
+        
+        # 验证数据完整性和顺序
+        for i, (key, value) in enumerate(all_pages_items):
+            expected_key = f"item:{i:03d}"
+            expected_value = f"value-{i:03d}"
+            assert key == expected_key, f"位置 {i} 的键应为 {expected_key}，实际是 {key}"
+            assert value == expected_value, f"位置 {i} 的值应为 {expected_value}，实际是 {value}"
+        
+        # 验证分页数量正确
+        expected_pages = (total_items + page_size - 1) // page_size  # 向上取整
+        assert current_page == expected_pages, f"应该有 {expected_pages} 页，实际有 {current_page}"
+        
+        # 测试反向分页
+        reverse_result = db.paginate(
+            prefix='item:', 
+            page_size=5,
+            reverse=True
+        )
+        
+        # 验证反向分页获取的是最后的数据
+        reverse_items = reverse_result['items']
+        assert len(reverse_items) == 5
+        
+        # 最后5个项目应该是反序的
+        for i, (key, value) in enumerate(reverse_items):
+            expected_index = total_items - 1 - i
+            expected_key = f"item:{expected_index:03d}"
+            assert key == expected_key, f"反向查询第 {i} 项应为 {expected_key}，实际是 {key}"
+        
+        db.close()

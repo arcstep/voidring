@@ -565,3 +565,126 @@ class TestCollectionManagement:
             assert user.name == "alice"
         finally:
             db2.close() 
+
+class TestRocksDBPagination:
+    """索引RocksDB分页功能测试"""
+    
+    @pytest.fixture
+    def db_with_data(self, db_path):
+        db = IndexedRocksDB(db_path)
+        db.register_collection("users", User)
+        db.register_index("users", User, "age")
+        db.register_index("users", User, "name")
+        
+        # 插入100条测试数据
+        for i in range(100):
+            age_group = i % 5
+            user = User(name=f"user{i:03d}", age=20 + age_group)
+            db.update_with_indexes("users", f"user:{i:03d}", user)
+            
+        try:
+            yield db
+        finally:
+            db.close()
+    
+    def test_index_pagination(self, db_with_data):
+        # 索引精确匹配分页
+        result = db_with_data.paginate_with_index(
+            collection_name="users",
+            field_path="age",
+            field_value=22,
+            page_size=5
+        )
+        
+        # 验证全部数据正确
+        self._verify_all_age_items(
+            db_with_data.paginate_with_index,
+            {"collection_name": "users", "field_path": "age", "field_value": 22},
+            expected_age=22
+        )
+    
+    def test_index_range_and_empty(self, db_with_data):
+        # 索引范围查询
+        items = self._collect_all_items(
+            db_with_data.paginate_with_index,
+            {
+                "collection_name": "users",
+                "field_path": "age", 
+                "start": 21,
+                "end": 24
+            }
+        )
+        
+        # 验证所有项的年龄在范围内
+        for _, user in items:
+            age = user.age if hasattr(user, 'age') else user['age']
+            assert 21 <= age < 24
+            
+        # 空结果查询
+        result = db_with_data.paginate_with_index(
+            collection_name="users",
+            field_path="age",
+            field_value=99
+        )
+        assert len(result["items"]) == 0
+        assert result["has_more"] == False
+    
+    def test_model_conversion(self, db_with_data):
+        # 查询并转换为模型
+        result = db_with_data.paginate_with_index(
+            collection_name="users",
+            field_path="age",
+            field_value=21,
+            page_size=5,
+            return_as_model=True
+        )
+        
+        # 验证结果都是模型实例且值正确
+        for _, user in result["items"]:
+            assert isinstance(user, User)
+            assert user.age == 21
+    
+    def _collect_all_pages(self, paginate_func, params, page_size=10):
+        """收集分页函数返回的所有页面的key"""
+        all_keys = []
+        cursor = None
+        
+        while True:
+            result = paginate_func(page_size=page_size, cursor=cursor, **params)
+            all_keys.extend([key for key, _ in result["items"]])
+            
+            if not result["has_more"]:
+                break
+                
+            cursor = result["next_cursor"]
+            
+        return all_keys
+    
+    def _collect_all_items(self, paginate_func, params, page_size=10):
+        """收集分页函数返回的所有页面的items"""
+        all_items = []
+        cursor = None
+        
+        while True:
+            result = paginate_func(page_size=page_size, cursor=cursor, **params)
+            all_items.extend(result["items"])
+            
+            if not result["has_more"]:
+                break
+                
+            cursor = result["next_cursor"]
+            
+        return all_items
+    
+    def _verify_all_age_items(self, paginate_func, params, expected_age, page_size=5):
+        """验证所有分页项的年龄属性"""
+        all_items = self._collect_all_items(paginate_func, params, page_size)
+        
+        # 验证所有项都有预期的age值
+        for _, user in all_items:
+            age = user.age if hasattr(user, 'age') else user['age']
+            assert age == expected_age
+            
+        # 验证没有重复项
+        keys = [k for k, _ in all_items]
+        assert len(keys) == len(set(keys)) 

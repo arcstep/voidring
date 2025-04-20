@@ -459,5 +459,74 @@ class BaseRocksDB:
     def __delitem__(self, key: Any) -> None:
         self.delete(key)
 
+    def paginate(
+        self, 
+        *,
+        page_size: int = 10,
+        cursor: Optional[str] = None,
+        include_cursor: bool = True,
+        **kwargs
+    ) -> dict:
+        """执行基于游标的分页查询
+        
+        Args:
+            page_size: 每页返回的最大项目数
+            cursor: 上一页返回的游标，首页不传
+            include_cursor: 是否在结果中包含当前游标
+            **kwargs: 传递给items方法的其他参数（如prefix, reverse, rdict等）
+            
+        Returns:
+            dict: 包含以下字段:
+                items: 当前页数据列表 [(key, value), ...]
+                has_more: 是否还有更多数据
+                next_cursor: 下一页游标，最后一页为None
+                prev_cursor: 上一页游标，首页为None
+        """
+        # 处理游标
+        if cursor:
+            # 解码游标并设置起始位置
+            kwargs['start'] = self._decode_cursor(cursor)
+        
+        # 确保不会与自己定义的limit冲突
+        if 'limit' in kwargs:
+            del kwargs['limit']
+        
+        # 执行查询
+        items = self.items(limit=page_size + 1, **kwargs)
+        
+        # 判断是否有下一页
+        has_more = len(items) > page_size
+        if has_more:
+            items = items[:page_size]  # 移除额外获取的项
+        
+        # 计算下一页游标
+        next_cursor = None
+        if has_more and items:
+            next_cursor = self._encode_cursor(items[-1][0])
+        
+        # 构建结果
+        result = {
+            'items': items,
+            'has_more': has_more,
+            'next_cursor': next_cursor
+        }
+        
+        if include_cursor and cursor:
+            result['prev_cursor'] = cursor
+        
+        return result
+
+    def _encode_cursor(self, key):
+        """将键编码为游标"""
+        import base64
+        return base64.urlsafe_b64encode(str(key).encode()).decode()
+
+    def _decode_cursor(self, cursor):
+        """从游标解码键"""
+        import base64
+        key = base64.urlsafe_b64decode(cursor.encode()).decode()
+        # 获取比这个key稍大的值作为起始点（排除当前key）
+        return key + '\0'
+
 
 

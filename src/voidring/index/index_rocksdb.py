@@ -639,3 +639,65 @@ class IndexedRocksDB(BaseRocksDB):
                 self._logger.warning(f"模型转换失败: {e}")
                 return data
         return data
+
+    def paginate_with_index(
+        self, 
+        *,
+        page_size: int = 10,
+        cursor: Optional[str] = None,
+        include_cursor: bool = True,
+        **kwargs
+    ) -> dict:
+        """执行基于索引的游标分页查询
+        
+        Args:
+            page_size: 每页返回的最大项目数
+            cursor: 上一页返回的游标，首页不传
+            include_cursor: 是否在结果中包含当前游标
+            **kwargs: 传递给iter_items_with_index的参数，如collection_name, field_path等
+            
+        Returns:
+            dict: 包含以下字段:
+                items: 当前页数据列表 [(key, value), ...]
+                has_more: 是否还有更多数据
+                next_cursor: 下一页游标，最后一页为None
+                prev_cursor: 上一页游标，首页为None
+        """
+        # 处理游标
+        if cursor:
+            decoded_key = self._decode_cursor(cursor)
+            # 处理start参数
+            if kwargs.get('reverse', False):
+                kwargs['end'] = decoded_key  # 反向查询时设置上界
+            else:
+                kwargs['start'] = decoded_key  # 正向查询时设置下界
+        
+        # 确保不会与自己定义的limit冲突
+        if 'limit' in kwargs:
+            del kwargs['limit']
+        
+        # 执行查询，多获取一项用于判断是否有下一页
+        query_limit = page_size + 1
+        items = list(self.iter_items_with_index(limit=query_limit, **kwargs))
+        
+        # 判断是否有下一页
+        has_more = len(items) > page_size
+        if has_more:
+            items = items[:page_size]  # 移除额外获取的项
+        
+        # 计算下一页游标
+        next_cursor = None
+        if has_more and items:
+            next_cursor = self._encode_cursor(items[-1][0])
+        
+        # 构建结果
+        result = {
+            'items': items,
+            'has_more': has_more,
+            'next_cursor': next_cursor
+        }
+        
+        if include_cursor and cursor:
+            result['prev_cursor'] = cursor
+        
+        return result
