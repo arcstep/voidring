@@ -1,4 +1,4 @@
-from typing import Type, Any, Optional, Dict, List, get_origin, Union, Iterator, Set
+from typing import Type, Any, Optional, Dict, List, get_origin, Union, Iterator, Set, Tuple
 from speedict import Options, Rdict, WriteBatch, DBCompressionType
 
 from ..base_rocksdb import BaseRocksDB
@@ -10,9 +10,23 @@ import hashlib
 import base64
 import re
 
+class CollectionInfo:
+    """集合信息类"""
+    def __init__(self, name: str, model_class: Type, cf_name: str = None):
+        self.name = name
+        self.model_class = model_class
+        self.cf_name = cf_name
+        self.field_paths = set()  # 索引的字段路径
+        
+    def add_field_path(self, field_path: str):
+        self.field_paths.add(field_path)
+        
+    def __repr__(self):
+        return f"CollectionInfo(name='{self.name}', model={self.model_class.__name__}, indexes={list(self.field_paths)})"
+
 class IndexedRocksDB(BaseRocksDB):
     """
-    支持针对一个模型的多种索引路径管理。
+    支持针对一个集合的多种索引路径管理。
 
     在增加、删除、修改对象时根据注册的索引路径自动更新索引。
     """
@@ -26,15 +40,18 @@ class IndexedRocksDB(BaseRocksDB):
             self.create_column_family(self.INDEX_METADATA_CF, options=self._get_indexes_cf_options())
         if self.INDEX_CF not in all_cfs:
             self.create_column_family(self.INDEX_CF, options=self._get_indexes_cf_options())
+            
+        # 内存中保存集合信息的字典，而不是存储在RocksDB中
+        self._collections: Dict[str, CollectionInfo] = {}
 
     INDEX_METADATA_CF = "indexes_metadata"  # 索引元数据列族
     INDEX_CF = "indexes"      # 索引列族
 
-    # 模型前缀
-    MODEL_PREFIX_FORMAT = "idx:{cf_name}:{model_name}"
+    # 集合前缀
+    COLLECTION_PREFIX_FORMAT = "idx:{cf_name}:{collection_name}"
 
     # 索引元数据格式
-    INDEX_METADATA_FORMAT = MODEL_PREFIX_FORMAT + ":{field_path}"
+    INDEX_METADATA_FORMAT = COLLECTION_PREFIX_FORMAT + ":{field_path}"
 
     # 索引格式
     INDEX_KEY_FORMAT = INDEX_METADATA_FORMAT + ":{value}:key:{key}"
@@ -235,20 +252,68 @@ class IndexedRocksDB(BaseRocksDB):
         if field_path != "#":
             self._accessor_registry.validate_path(model_class, field_path)
     
-    def get_field_value(self, model_class: Type, field_path: str, key: str) -> Any:
-        """获取字段值"""
+    def get_field_value(self, obj: Any, field_path: str, key: str) -> Any:
+        """获取字段值，支持字典和对象"""
         if field_path == "#":
             return key
+            
+        # 处理字典类型 - 计算属性特殊处理
+        if isinstance(obj, dict) and field_path in self._collections.get(obj.get("_collection", ""), CollectionInfo("", dict)).field_paths:
+            # 尝试将字典转换回模型实例以获取计算属性
+            try:
+                collection_info = self._collections.get(obj.get("_collection", ""))
+                if collection_info and hasattr(collection_info.model_class, field_path):
+                    # 检查是否为属性
+                    if isinstance(getattr(collection_info.model_class, field_path, None), property):
+                        # 临时将字典转换回模型实例
+                        instance = collection_info.model_class.model_validate(obj)
+                        return getattr(instance, field_path)
+            except Exception as e:
+                self._logger.debug(f"计算属性获取失败: {e}")
+            
+            # 常规字典值获取
+            parts = field_path.split(".")
+            value = obj
+            for part in parts:
+                if part in value:
+                    value = value[part]
+                else:
+                    return None
+            return value
         else:
-            return self._accessor_registry.get_field_value(model_class, field_path)
+            # 原有逻辑处理对象
+            return self._accessor_registry.get_field_value(obj, field_path)
     
-    def register_indexes(self, model_name: str, model_class: Type, field_paths: List[str], cf_name: str=None):
-        """批量注册模型的索引配置"""
+    def register_collections(self, collection_name: str, model_class: Type, field_paths: List[str], cf_name: str=None):
+        """批量注册集合的索引配置"""
         for field_path in field_paths:
-            self.register_index(model_name, model_class, field_path, cf_name)
+            self.register_index(collection_name, model_class, field_path, cf_name)
+            
+    def get_collections(self) -> List[CollectionInfo]:
+        """获取所有注册的集合信息"""
+        return list(self._collections.values())
+    
+    def get_collection_info(self, collection_name: str) -> Optional[CollectionInfo]:
+        """获取指定集合的信息"""
+        return self._collections.get(collection_name)
 
-    def register_index(self, model_name: str, model_class: Type, field_path: str, cf_name: str=None):
-        """注册模型的索引配置"""
+    def register_collection(self, collection_name: str, model_class: Type, cf_name: str=None):
+        """
+        注册集合
+
+        如果要使用 iter_collection_keys 或 rebuild_indexes 方法，必须先注册集合。
+        """
+        cf_name = cf_name or self.default_cf_name
+        
+        # 在内存中注册集合
+        if collection_name not in self._collections:
+            self._collections[collection_name] = CollectionInfo(collection_name, model_class, cf_name)
+            
+        # 注册主键索引
+        self.register_index(collection_name, model_class, field_path="#", cf_name=cf_name)
+
+    def register_index(self, collection_name: str, model_class: Type, field_path: str, cf_name: str=None):
+        """注册集合的索引配置"""
 
         # 验证字段路径的语法是否合法
         try:
@@ -265,45 +330,58 @@ class IndexedRocksDB(BaseRocksDB):
             self._logger.error(f"字段路径验证失败: {e}")
             raise
 
-        # 注册索引元数据
-        base_type = self._get_base_type(model_class)
+        # 确保集合已注册
         cf_name = cf_name or self.default_cf_name
+        if collection_name not in self._collections:
+            self._collections[collection_name] = CollectionInfo(collection_name, model_class, cf_name)
+        
+        # 添加字段路径到集合信息
+        self._collections[collection_name].add_field_path(field_path)
+
+        # 构建索引键
         key = self.INDEX_METADATA_FORMAT.format(
             cf_name=cf_name,
-            model_name=model_name,
+            collection_name=collection_name,
             field_path=field_path
         )
 
-        # 使用确定性的检查
+        # 内存中已有元数据，仅在RocksDB创建索引标识
         try:
-            existing_type = self.indexes_metadata_cf.get(key)
-            if existing_type is None:  # 确实不存在
-                self.indexes_metadata_cf[key] = base_type
-                self._logger.debug(f"注册索引元数据: {key} -> {cf_name}.{model_name}#{field_path}")
+            existing_entry = self.indexes_metadata_cf.get(key)
+            if existing_entry is None:  # 确实不存在
+                # 只存储一个标记，不再存储类型
+                self.indexes_metadata_cf[key] = True
+                self._logger.debug(f"注册索引元数据: {key} -> {cf_name}.{collection_name}#{field_path}")
             else:
-                self._logger.debug(f"索引元数据已存在: {key} -> {existing_type}")
+                self._logger.debug(f"索引元数据已存在: {key}")
         except KeyError:  # 确实不存在
-            self.indexes_metadata_cf[key] = base_type
-            self._logger.debug(f"注册索引元数据: {key} -> {cf_name}.{model_name}#{field_path}")
-        except ModuleNotFoundError:
-            self._logger.warning(f"曾经注册的模块无法找到，这可能导致数据无法正确读取: {model_class}")
+            self.indexes_metadata_cf[key] = True
+            self._logger.debug(f"注册索引元数据: {key} -> {cf_name}.{collection_name}#{field_path}")
 
-    def _make_index_key(self, model_name: str, field_path: str, field_value: Any, key: str, cf_name: str=None) -> str:
+    def _make_index_key(self, collection_name: str, field_path: str, field_value: Any, key: str, cf_name: str=None) -> str:
         """创建索引键"""
         key = self._escape_special_chars(key)
         formatted_value = self.format_index_value(field_value)
         cf_name = cf_name or self.default_cf_name
         return self.INDEX_KEY_FORMAT.format(
             cf_name=cf_name,
-            model_name=model_name,
+            collection_name=collection_name,
             field_path=field_path,
             value=formatted_value,
             key=key
         )
     
-    def update_with_indexes(self, model_name: str, key: str, value: Any, cf_name: str=None):
+    def update_with_indexes(self, collection_name: str, key: str, value: Any, cf_name: str=None):
         """更新键值，并自动更新索引"""
-        self._logger.debug(f"开始更新索引: model_name={model_name}, key={key}, value=`{str(value)[:300]}`, cf_name={cf_name}")
+        
+        # 自动检测并转换Pydantic模型
+        if hasattr(value, "model_dump"):  # Pydantic v2
+            value = value.model_dump()
+            value["_collection"] = collection_name  # 添加集合标记
+        elif hasattr(value, "dict"):      # Pydantic v1
+            value = value.dict()
+        
+        self._logger.debug(f"开始更新索引: collection={collection_name}, key={key}, value=`{str(value)[:300]}`, cf_name={cf_name}")
 
         cf_name = cf_name or self.default_cf_name
         cf = self.get_column_family(cf_name)
@@ -312,9 +390,9 @@ class IndexedRocksDB(BaseRocksDB):
         key_existing, old_value = self.key_exist(key, rdict=cf)
 
         # 获取对象所有路径
-        model_prefix = self.MODEL_PREFIX_FORMAT.format(cf_name=cf_name, model_name=model_name)
+        collection_prefix = self.COLLECTION_PREFIX_FORMAT.format(cf_name=cf_name, collection_name=collection_name)
 
-        all_paths = self.keys(prefix=model_prefix, rdict=self.indexes_metadata_cf)
+        all_paths = self.keys(prefix=collection_prefix, rdict=self.indexes_metadata_cf)
 
         if not all_paths:
             cf.put(key, value)
@@ -334,7 +412,7 @@ class IndexedRocksDB(BaseRocksDB):
             if key_existing:
                 field_value = self.get_field_value(old_value, field_path, key)
                 old_index = self._make_index_key(
-                    model_name=model_name,
+                    collection_name=collection_name,
                     field_path=field_path,
                     field_value=field_value,
                     key=key,
@@ -344,7 +422,7 @@ class IndexedRocksDB(BaseRocksDB):
                 self._logger.debug(f"准备删除旧索引: {old_index}")
             field_value = self.get_field_value(value, field_path, key)
             new_index = self._make_index_key(
-                model_name=model_name,
+                collection_name=collection_name,
                 field_path=field_path,
                 field_value=field_value,
                 key=key,
@@ -356,9 +434,9 @@ class IndexedRocksDB(BaseRocksDB):
         self.write(batch)
         self._logger.debug(f"批处理任务提交完成，值和索引已更新")
 
-    def delete_with_indexes(self, model_name: str, key: str, cf_name: str=None):
+    def delete_with_indexes(self, collection_name: str, key: str, cf_name: str=None):
         """删除键值，并自动删除索引"""
-        self._logger.debug(f"开始删除索引: model_name={model_name}, key={key}, cf_name={cf_name}")
+        self._logger.debug(f"开始删除索引: collection={collection_name}, key={key}, cf_name={cf_name}")
 
         cf_name = cf_name or self.default_cf_name
         cf = self.get_column_family(cf_name)
@@ -376,9 +454,9 @@ class IndexedRocksDB(BaseRocksDB):
         batch.delete(key, cf_handle)
 
         # 获取对象所有路径
-        model_prefix = self.MODEL_PREFIX_FORMAT.format(cf_name=cf_name, model_name=model_name)
+        collection_prefix = self.COLLECTION_PREFIX_FORMAT.format(cf_name=cf_name, collection_name=collection_name)
 
-        all_paths = self.keys(prefix=model_prefix, rdict=self.indexes_metadata_cf)
+        all_paths = self.keys(prefix=collection_prefix, rdict=self.indexes_metadata_cf)
 
         if not all_paths:
             self.write(batch)
@@ -391,7 +469,7 @@ class IndexedRocksDB(BaseRocksDB):
             field_path = self._fetch_field_path_from_index(path)
             field_value = self.get_field_value(old_value, field_path, key)
             old_index = self._make_index_key(
-                model_name=model_name,
+                collection_name=collection_name,
                 field_path=field_path,
                 field_value=field_value,
                 key=key,
@@ -405,7 +483,7 @@ class IndexedRocksDB(BaseRocksDB):
 
     def iter_keys_with_index(
         self,
-        model_name: str,
+        collection_name: str,
         field_path: str,
         field_value: Any = None, 
         start: Optional[Any] = None,
@@ -419,19 +497,19 @@ class IndexedRocksDB(BaseRocksDB):
         
         # 构建基础前缀
         cf_name = cf_name or self.default_cf_name
-        model_prefix = self.MODEL_PREFIX_FORMAT.format(cf_name=cf_name, model_name=model_name)
+        collection_prefix = self.COLLECTION_PREFIX_FORMAT.format(cf_name=cf_name, collection_name=collection_name)
         
         if start is not None or end is not None:
             # 范围查询时，确保只查询指定字段的索引
             start_key = self._make_index_key(
-                model_name=model_name,
+                collection_name=collection_name,
                 field_path=field_path,
                 field_value=start,
                 key="",
                 cf_name=cf_name
             )
             end_key = self._make_index_key(
-                model_name=model_name,
+                collection_name=collection_name,
                 field_path=field_path,
                 field_value=end,
                 key="",
@@ -442,7 +520,7 @@ class IndexedRocksDB(BaseRocksDB):
             start_key = None
             end_key = None
             target_key = self._make_index_key(
-                model_name=model_name,
+                collection_name=collection_name,
                 field_path=field_path,
                 field_value=field_value,
                 key="",
@@ -462,9 +540,31 @@ class IndexedRocksDB(BaseRocksDB):
             key = self._fetch_key_from_index(index)
             yield key
     
-    def iter_items_with_index(self, *args, **kwargs):
-        for key in self.iter_keys_with_index(*args, **kwargs):
-            yield key, self.get(key, rdict=kwargs.get("rdict", None))
+    def iter_items_with_index(self, collection_name: str, *args, model_class=None, return_as_model=True, **kwargs):
+        """迭代索引匹配的键值对
+        
+        Args:
+            collection_name: 集合名称
+            *args: 传递给iter_keys_with_index的位置参数
+            model_class: 要转换成的Pydantic模型类，如果为None但return_as_model为True则尝试使用注册的模型
+            return_as_model: 是否将值转换为模型实例，默认为True
+            **kwargs: 传递给iter_keys_with_index的关键字参数
+        """
+        # 如果没有指定model_class但需要转换，尝试从注册表中获取
+        if model_class is None and return_as_model and collection_name in self._collections:
+            model_class = self._collections[collection_name].model_class
+            
+        for key in self.iter_keys_with_index(collection_name, *args, **kwargs):
+            value = self.get(key, rdict=kwargs.get("rdict", None))
+            
+            if return_as_model and model_class and isinstance(value, dict):
+                try:
+                    value = model_class.model_validate(value)
+                except Exception as e:
+                    self._logger.warning(f"转换模型失败: {e}")
+                    # 转换失败时仍返回原始值
+            
+            yield key, value
 
     def items_with_index(self, *args, **kwargs):
         return list(self.iter_items_with_index(*args, **kwargs))
@@ -475,35 +575,67 @@ class IndexedRocksDB(BaseRocksDB):
     def values_with_index(self, *args, **kwargs):
         return [v for _, v in self.iter_items_with_index(*args, **kwargs)]
 
-    def register_model(self, model_name: str, model_class: Type, cf_name: str=None):
-        """
-        注册模型
-
-        如果要使用 iter_model_keys 或 rebuild_indexes 方法，必须先注册模型。
-        """
-        self.register_index(model_name, model_class=model_class, field_path="#", cf_name=cf_name)
-
-    def iter_model_keys(self, model_name: str, cf_name: str=None):
-        """迭代模型的所有键，即查找模型的所有实例。"""
+    def iter_collection_keys(self, collection_name: str, cf_name: str=None):
+        """迭代集合的所有键，即查找集合的所有实例。"""
         cf_name = cf_name or self.default_cf_name
-        model_keys_prefix = self.MODEL_PREFIX_FORMAT.format(cf_name=cf_name, model_name=model_name) + ":#:"
-        resp = self.iter_keys(prefix=model_keys_prefix, rdict=self.indexes_cf)
-        self._logger.debug(f"iter_model_keys: {resp}")
+        collection_keys_prefix = self.COLLECTION_PREFIX_FORMAT.format(cf_name=cf_name, collection_name=collection_name) + ":#:"
+        resp = self.iter_keys(prefix=collection_keys_prefix, rdict=self.indexes_cf)
+        self._logger.debug(f"iter_collection_keys: {resp}")
         for index in resp:
             key = self._fetch_key_from_index(index)
-            self._logger.debug(f"iter_model_keys: {key}")
+            self._logger.debug(f"iter_collection_keys: {key}")
             yield key
+            
+    def iter_collection(self, collection_name: str, cf_name: str=None, return_as_model=True):
+        """迭代集合中的所有项目"""
+        cf_name = cf_name or self.default_cf_name
+        cf = self.get_column_family(cf_name)
+        
+        # 获取模型类
+        model_class = None
+        if return_as_model and collection_name in self._collections:
+            model_class = self._collections[collection_name].model_class
+            
+        for key in self.iter_collection_keys(collection_name, cf_name):
+            value = cf.get(key)
+            
+            if return_as_model and model_class and isinstance(value, dict):
+                try:
+                    value = model_class.model_validate(value)
+                except Exception as e:
+                    self._logger.warning(f"转换模型失败: {e}")
+            
+            yield key, value
 
-    def rebuild_indexes(self, model_name: str, cf_name: str=None):
-        """重建模型所有实例的索引"""
+    def rebuild_indexes(self, collection_name: str, cf_name: str=None):
+        """重建集合所有实例的索引"""
         cf_name = cf_name or self.default_cf_name
         cf = self.get_column_family(cf_name)
 
-        for key in self.iter_model_keys(model_name, cf_name):
+        for key in self.iter_collection_keys(collection_name, cf_name):
             self.update_with_indexes(
-                model_name=model_name,
+                collection_name=collection_name,
                 key=key,
                 value=cf[key],
                 cf_name=cf_name
             )
         self._logger.debug(f"重建索引完成")
+
+    def get_as_model(self, collection_name: str, key: str, model_class=None, cf_name=None):
+        """获取数据并自动转换为模型实例"""
+        # 如果未指定model_class，尝试从注册表获取
+        if model_class is None and collection_name in self._collections:
+            model_class = self._collections[collection_name].model_class
+            
+        if model_class is None:
+            self._logger.warning(f"无法找到集合 {collection_name} 的模型类定义")
+            return self.get(key, rdict=self.get_column_family(cf_name or self.default_cf_name))
+            
+        data = self.get(key, rdict=self.get_column_family(cf_name or self.default_cf_name))
+        if data and isinstance(data, dict):
+            try:
+                return model_class.model_validate(data)
+            except Exception as e:
+                self._logger.warning(f"模型转换失败: {e}")
+                return data
+        return data
