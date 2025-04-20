@@ -1,5 +1,5 @@
 from typing import Type, Any, Optional, Dict, List, get_origin, Union, Iterator, Set, Tuple
-from speedict import Options, Rdict, WriteBatch, DBCompressionType
+from rocksdict import Options, Rdict, WriteBatch, DBCompressionType
 
 from ..base_rocksdb import BaseRocksDB
 from .accessor import AccessorRegistry
@@ -31,8 +31,8 @@ class IndexedRocksDB(BaseRocksDB):
     在增加、删除、修改对象时根据注册的索引路径自动更新索引。
     """
 
-    def __init__(self, path: str = None, options: Optional[Options] = None):
-        super().__init__(path, options)
+    def __init__(self, path: str = None, *args, **kwargs):
+        super().__init__(path, *args, **kwargs)
 
         # 创建索引元数据的列族
         all_cfs = self.list_column_families(self.path)

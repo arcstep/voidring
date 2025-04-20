@@ -2,7 +2,7 @@ import logging
 import itertools
 import os
 
-from speedict import Rdict, Options, WriteBatch, SstFileWriter, ReadOptions, WriteOptions
+from rocksdict import Rdict, Options, WriteBatch, SstFileWriter, ReadOptions, WriteOptions
 from typing import Any, Iterator, Optional, Union, Tuple, Literal
 from dataclasses import dataclass
 from enum import Enum
@@ -40,7 +40,8 @@ class BaseRocksDB:
     def __init__(
         self,
         path: str,
-        options: Optional[Options] = None
+        *args,
+        **kwargs
     ):
         """初始化BaseRocksDB
         
@@ -53,7 +54,7 @@ class BaseRocksDB:
         if not os.path.exists(self.path):
             raise FileNotFoundError(f"数据库路径不存在: {self.path}")
 
-        self._db = Rdict(self.path, options)
+        self._db = Rdict(self.path, *args, **kwargs)
         self._logger = logging.getLogger(__name__)
         self._default_cf = self._db.get_column_family("default")
         self._default_cf_name = "default"
