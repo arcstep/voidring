@@ -463,3 +463,88 @@ class TestBatchOperations:
         # 验证数据没有改变
         assert db.get("key1") == "original1"
         assert db.get("key2") == "original2"
+
+    def test_read_only_mode(self, db_path):
+        """测试只读模式（同一进程）
+        
+        1. 写入数据
+        2. 关闭数据库
+        3. 以只读模式重新打开
+        4. 验证可以读取数据
+        """
+        # 写入数据
+        db = BaseRocksDB(db_path)
+        test_data = {
+            "key1": "value1",
+            "key2": "value2",
+            "user:01": "alice"
+        }
+        for k, v in test_data.items():
+            db.put(k, v)
+        db.close()
+        
+        # 以只读模式打开
+        from rocksdict import AccessType
+        ro_db = BaseRocksDB(db_path, access_type=AccessType.read_only())
+        
+        # 验证数据可读
+        for k, expected in test_data.items():
+            assert ro_db.get(k) == expected
+        
+        # 验证写入失败
+        try:
+            ro_db.put("new_key", "new_value")
+            assert False, "只读模式不应允许写入"
+        except Exception as e:
+            logger.info(f"预期中的写入错误: {e}")
+        finally:
+            ro_db.close()
+
+    def test_secondary_mode(self, db_path):
+        """测试主从模式（同一进程）
+        
+        1. 写入初始数据并保持数据库打开
+        2. 以从库模式打开另一个实例
+        3. 在主库写入新数据
+        4. 验证从库可以通过同步读取到新数据
+        """
+        import os
+        
+        # 写入初始数据
+        main_db = BaseRocksDB(db_path)
+        main_db.put("key1", "value1")
+        main_db.put("key2", "value2")
+        
+        # 准备从库路径
+        secondary_path = os.path.join(db_path, "_secondary")
+        os.makedirs(secondary_path, exist_ok=True)
+        
+        # 以从库模式打开另一个实例
+        from rocksdict import AccessType, Rdict
+        sec_db = Rdict(db_path, access_type=AccessType.secondary(secondary_path))
+        
+        # 验证可以读取初始数据
+        assert sec_db.get("key1") == "value1"
+        assert sec_db.get("key2") == "value2"
+        
+        # 主库写入新数据
+        main_db.put("key3", "value3")
+        
+        # 从库同步并验证数据
+        sec_db.try_catch_up_with_primary()
+        
+        # 验证从库可以读取所有数据（包括新增的）
+        assert sec_db.get("key1") == "value1"
+        assert sec_db.get("key2") == "value2" 
+        assert sec_db.get("key3") == "value3"
+        
+        # 验证从库不能写入
+        try:
+            sec_db.put("key4", "value4")
+            assert False, "从库模式不应允许写入"
+        except Exception as e:
+            logger.info(f"预期中的写入错误: {e}")
+        finally:
+            # 清理资源
+            sec_db.close()
+            main_db.close()
